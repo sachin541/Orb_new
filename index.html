@@ -2,128 +2,30 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>ORB -> JSON</title>
-  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ORB Benchmark</title>
+
   <style>
     body{font-family:system-ui,Arial;margin:16px}
     canvas,img{max-width:520px;width:520px;height:auto;border:1px solid #ddd}
     #log{white-space:pre;font-family:ui-monospace,Menlo,monospace;font-size:12px}
+    button{margin-left:8px}
   </style>
+
+  <!-- OpenCV.js -->
+  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
 </head>
 <body>
   <input id="file" type="file" accept="image/*">
-  <button id="run" disabled>Compute + Save JSON</button>
+  <button id="run" disabled>Run Benchmark</button>
   <div id="log"></div>
   <img id="img" alt="" style="display:none">
   <canvas id="c"></canvas>
 
-<script>
-const fileEl = document.getElementById("file");
-const imgEl  = document.getElementById("img");
-const btn    = document.getElementById("run");
-const canvas = document.getElementById("c");
-const logEl  = document.getElementById("log");
-const log = (s)=> logEl.textContent += s + "\n";
+  <!-- Excel export (SheetJS) -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 
-function waitCvReady(){
-  return new Promise(res=>{
-    const t=setInterval(()=>{
-      if (window.cv && cv.Mat){ clearInterval(t); res(); }
-    },50);
-  });
-}
-
-function downloadJSON(obj, filename){
-  const blob = new Blob([JSON.stringify(obj)], {type:"application/json"});
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = filename;
-  a.click();
-  setTimeout(()=>URL.revokeObjectURL(a.href), 500);
-}
-
-function matToU8Array(mat){
-  const n = mat.rows * mat.cols * mat.channels();
-  return Array.from(mat.data.slice(0, n)); // small + simple (bigger files)
-}
-
-function kpVecToArray(kpVec){
-  const out = [];
-  for (let i=0;i<kpVec.size();i++){
-    const kp = kpVec.get(i);
-    out.push({
-      x: kp.pt.x, y: kp.pt.y,
-      size: kp.size, angle: kp.angle,
-      response: kp.response, octave: kp.octave,
-      class_id: kp.class_id
-    });
-  }
-  return out;
-}
-
-async function main(){
-  await waitCvReady();
-  log("OpenCV ready");
-
-  fileEl.onchange = ()=>{
-    const f = fileEl.files && fileEl.files[0];
-    if (!f) return;
-    logEl.textContent = "";
-    imgEl.onload = ()=>{
-      canvas.width = imgEl.naturalWidth;
-      canvas.height = imgEl.naturalHeight;
-      const ctx = canvas.getContext("2d");
-      ctx.drawImage(imgEl,0,0);
-      btn.disabled = false;
-      log(`Image: ${imgEl.naturalWidth}x${imgEl.naturalHeight}`);
-    };
-    imgEl.src = URL.createObjectURL(f);
-  };
-
-  btn.onclick = ()=>{
-    const src = cv.imread(imgEl);
-    const gray = new cv.Mat();
-    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-
-    const orb = new cv.ORB(); // defaults (minimal)
-    const kps = new cv.KeyPointVector();
-    const desc = new cv.Mat();
-    orb.detectAndCompute(gray, new cv.Mat(), kps, desc, false);
-
-    log(`Keypoints: ${kps.size()}`);
-    log(`Descriptors: ${desc.rows}x${desc.cols} type=${desc.type()}`);
-
-    // (optional) draw keypoints to canvas
-    const out = new cv.Mat();
-    cv.drawKeypoints(src, kps, out);
-    cv.imshow(canvas, out);
-
-    const json = {
-      meta: {
-        detector: "ORB",
-        width: imgEl.naturalWidth,
-        height: imgEl.naturalHeight,
-        descriptorCols: desc.cols,
-        descriptorType: desc.type()
-      },
-      keypoints: kpVecToArray(kps),
-      descriptors: {
-        rows: desc.rows,
-        cols: desc.cols,
-        data: matToU8Array(desc) // flat row-major uint8 list
-      }
-    };
-
-    downloadJSON(json, "orb_reference.json");
-
-    // cleanup
-    src.delete(); gray.delete(); out.delete();
-    kps.delete(); desc.delete(); orb.delete();
-
-    log("Saved: orb_reference.json");
-  };
-}
-main();
-</script>
+  <!-- Your benchmark code -->
+  <script type="module" src="./main.js"></script>
 </body>
 </html>
