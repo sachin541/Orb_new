@@ -1,0 +1,158 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>ORB Descriptor Export</title>
+  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+</head>
+<body>
+
+<input type="file" id="file" accept="image/*">
+<button id="run" disabled>Generate descriptor.js</button>
+
+<script>
+const fileEl = document.getElementById("file");
+const runBtn = document.getElementById("run");
+const img = new Image();
+
+function waitCV(){
+  return new Promise(res=>{
+    const t = setInterval(()=>{
+      if (window.cv && cv.Mat) {
+        clearInterval(t);
+        res();
+      }
+    }, 50);
+  });
+}
+
+fileEl.onchange = () => {
+  const f = fileEl.files[0];
+  if (!f) return;
+  img.onload = () => runBtn.disabled = false;
+  img.src = URL.createObjectURL(f);
+};
+
+runBtn.onclick = async () => {
+  await waitCV();
+
+  const src = cv.imread(img);
+  const gray = new cv.Mat();
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+  // -------- ORB PARAMETERS (LOCK THESE) --------
+const ORB = {
+  nfeatures: 5000,        // Maximum number of keypoints to retain.
+                          // Higher = more matches & robustness, but slower.
+
+  scaleFactor: 1.2,       // Image pyramid scale factor between levels.
+                          // Smaller (e.g. 1.1) = better scale invariance, slower.
+                          // Larger (e.g. 1.3) = faster, worse for scale changes.
+
+  nlevels: 8,             // Number of pyramid levels.
+                          // More levels = better detection at different scales.
+
+  edgeThreshold: 10,      // Minimum distance (in pixels) from image borders.
+                          // Prevents unstable keypoints near edges.
+
+  firstLevel: 0,          // Pyramid level to start detection from.
+                          // 0 = use original image resolution.
+
+  WTA_K: 2,               // Number of points used in each BRIEF test.
+                          // 2 = standard ORB (binary descriptor, Hamming).
+                          // 3 or 4 = more distinctive, but slower & incompatible
+                          // with standard Hamming-based matching.
+
+  scoreType: cv.ORB_HARRIS_SCORE, 
+                          // Method used to rank keypoints.
+                          // HARRIS = more stable & accurate than FAST score.
+                          // FAST_SCORE = faster, less stable.
+
+  patchSize: 31,          // Size of the patch used for orientation & descriptor.
+                          // Larger = more robust orientation, slightly slower.
+
+  fastThreshold: 12       // Threshold for FAST corner detector.
+                          // Lower = more keypoints (noisier).
+                          // Higher = fewer, stronger, more reliable keypoints.
+};
+
+
+  const orb = new cv.ORB(
+    ORB.nfeatures,
+    ORB.scaleFactor,
+    ORB.nlevels,
+    ORB.edgeThreshold,
+    ORB.firstLevel,
+    ORB.WTA_K,
+    ORB.scoreType,
+    ORB.patchSize,
+    ORB.fastThreshold
+  );
+
+  const kps = new cv.KeyPointVector();
+  const desc = new cv.Mat();
+  orb.detectAndCompute(gray, new cv.Mat(), kps, desc, false);
+
+  // ---- serialize keypoints ----
+  const keypoints = [];
+  for (let i = 0; i < kps.size(); i++) {
+    const kp = kps.get(i);
+    keypoints.push({
+      x: kp.pt.x,
+      y: kp.pt.y,
+      angle: kp.angle,
+      size: kp.size,
+      octave: kp.octave
+    });
+  }
+
+  // ---- serialize descriptors ----
+  const descriptorData = Array.from(desc.data);
+
+  const js = `
+export const DESCRIPTOR = {
+  image: {
+    width: ${img.naturalWidth},
+    height: ${img.naturalHeight}
+  },
+  orbParams: {
+    nfeatures: ${ORB.nfeatures},
+    scaleFactor: ${ORB.scaleFactor},
+    nlevels: ${ORB.nlevels},
+    edgeThreshold: ${ORB.edgeThreshold},
+    firstLevel: ${ORB.firstLevel},
+    WTA_K: ${ORB.WTA_K},
+    scoreType: "HARRIS",
+    patchSize: ${ORB.patchSize},
+    fastThreshold: ${ORB.fastThreshold}
+  },
+  keypoints: ${JSON.stringify(keypoints)},
+  descriptors: {
+    rows: ${desc.rows},
+    cols: ${desc.cols},
+    data: new Uint8Array(${JSON.stringify(descriptorData)})
+  }
+};
+`.trim();
+
+  download(js, "descriptor.js");
+
+  src.delete();
+  gray.delete();
+  kps.delete();
+  desc.delete();
+  orb.delete();
+};
+
+function download(text, name){
+  const blob = new Blob([text], { type: "text/javascript" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+</script>
+
+</body>
+</html>
