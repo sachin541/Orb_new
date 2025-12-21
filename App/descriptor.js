@@ -4,7 +4,7 @@ export const DESCRIPTOR = {
     height: 634
   },
   orbParams: {
-    nfeatures: 3000,
+    nfeatures: 5000,
     scaleFactor: 1.2,
     nlevels: 8,
     edgeThreshold: 10,

@@ -1,4 +1,4 @@
-// lsh.js - Balanced version with temporal tracking (faster matching)
+// lsh.js - Balanced version with temporal tracking and gyro integration
 // Pure-JS approximate matcher for ORB (binary 32-byte descriptors)
 
 const popcnt8 = new Uint8Array(256);
@@ -231,113 +231,240 @@ export function getMatchingStats(matches){
   };
 }
 
-// Temporal tracker for stable homography across frames
+// Temporal tracker for stable homography across frames with gyro integration
 export class TemporalTracker {
   constructor({
-    smoothingFactor = 0.25,
-    predictionWeight = 0.2,
-    minMatchesForUpdate = 6,
+    smoothingFactor = 0.5,
+    scaleSmoothing = 0.15,
+    minMatchesForUpdate = 4,
     maxFramesWithoutDetection = 12,
-    adaptiveRelaxation = true
+    adaptiveRelaxation = true,
+    maxScaleChange = 0.15,
+    useGyro = true,
+    gyroWeight = 0.3
   } = {}){
     this.smoothingFactor = smoothingFactor;
-    this.predictionWeight = predictionWeight;
+    this.scaleSmoothing = scaleSmoothing;
     this.minMatchesForUpdate = minMatchesForUpdate;
     this.maxFramesWithoutDetection = maxFramesWithoutDetection;
     this.adaptiveRelaxation = adaptiveRelaxation;
+    this.maxScaleChange = maxScaleChange;
+    this.useGyro = useGyro;
+    this.gyroWeight = gyroWeight;
     
-    this.prevCorners = null;
-    this.prevPrevCorners = null;
-    this.velocity = null;
+    this.prevTransform = null;
     this.framesWithoutDetection = 0;
     this.isTracking = false;
     this.confidenceHistory = [];
+    
+    // Gyro integration
+    this.lastGyroTimestamp = null;
+    this.accumulatedRotation = { x: 0, y: 0, z: 0 };
+    this.gyroBaseline = null;
   }
   
-  update(corners, matchCount){
+  updateGyro(gyroData){
+    if (!this.useGyro || !gyroData) return;
+    
+    const now = performance.now();
+    
+    if (this.lastGyroTimestamp === null){
+      this.lastGyroTimestamp = now;
+      this.gyroBaseline = { x: gyroData.x, y: gyroData.y, z: gyroData.z };
+      return;
+    }
+    
+    const dt = (now - this.lastGyroTimestamp) / 1000; // Convert to seconds
+    this.lastGyroTimestamp = now;
+    
+    // Integrate rotation (gyro gives angular velocity in rad/s)
+    // We primarily care about Z-axis rotation (device rotation in plane)
+    this.accumulatedRotation.z += gyroData.z * dt;
+    this.accumulatedRotation.x += gyroData.x * dt;
+    this.accumulatedRotation.y += gyroData.y * dt;
+  }
+  
+  update(corners, matchCount, gyroData = null){
+    // Update gyro if provided
+    if (gyroData){
+      this.updateGyro(gyroData);
+    }
+    
     if (!corners || matchCount < this.minMatchesForUpdate){
       this.framesWithoutDetection++;
       
-      if (this.isTracking && this.prevCorners && this.velocity && 
+      // If we have gyro data and previous transform, predict position
+      if (this.prevTransform && this.useGyro && this.accumulatedRotation && 
           this.framesWithoutDetection <= this.maxFramesWithoutDetection){
-        const predicted = this._predictCorners();
-        return { corners: predicted, confidence: 0.3, mode: 'predicted' };
+        const predicted = this._predictWithGyro();
+        return { corners: predicted.corners, confidence: 0.3, mode: 'gyro-predicted' };
       }
       
       if (this.framesWithoutDetection > this.maxFramesWithoutDetection){
         this.reset();
       }
       
-      return { corners: null, confidence: 0, mode: 'lost' };
+      return { corners: this.prevTransform?.corners || null, confidence: 0, mode: 'lost' };
     }
     
     this.framesWithoutDetection = 0;
     
-    if (!this.prevCorners){
-      this.prevCorners = this._cloneCorners(corners);
+    // Extract geometric properties from corners
+    const transform = this._extractTransform(corners);
+    
+    if (!this.prevTransform){
+      this.prevTransform = transform;
       this.isTracking = true;
+      // Reset gyro baseline when we start tracking
+      if (this.useGyro){
+        this.accumulatedRotation = { x: 0, y: 0, z: 0 };
+      }
       return { corners, confidence: 0.8, mode: 'initial' };
     }
     
-    if (this.prevPrevCorners){
-      this.velocity = [];
-      for (let i = 0; i < 4; i++){
-        this.velocity.push({
-          x: this.prevCorners[i].x - this.prevPrevCorners[i].x,
-          y: this.prevCorners[i].y - this.prevPrevCorners[i].y
-        });
-      }
+    // Apply gyro correction to rotation if available
+    let targetRotation = transform.rotation;
+    if (this.useGyro && this.accumulatedRotation){
+      // Gyro Z-axis rotation corresponds to device rotation in plane
+      // Subtract because camera rotation is inverse of device rotation
+      const gyroDelta = -this.accumulatedRotation.z;
+      targetRotation = transform.rotation + gyroDelta * this.gyroWeight;
     }
     
-    const smoothed = [];
-    const alpha = this.smoothingFactor;
+    // Adaptive smoothing - use more responsive tracking when we have good matches
+    const posAlpha = matchCount > 15 ? 0.7 : this.smoothingFactor;
+    const rotAlpha = matchCount > 15 ? 0.6 : this.smoothingFactor;
     
-    for (let i = 0; i < 4; i++){
-      let x = (1 - alpha) * this.prevCorners[i].x + alpha * corners[i].x;
-      let y = (1 - alpha) * this.prevCorners[i].y + alpha * corners[i].y;
-      
-      if (this.velocity && this.predictionWeight > 0){
-        x += this.predictionWeight * this.velocity[i].x;
-        y += this.predictionWeight * this.velocity[i].y;
-      }
-      
-      smoothed.push({ x, y });
+    // Much slower smoothing for scale to prevent flickering
+    const scaleAlpha = this.scaleSmoothing;
+    
+    // Clamp scale changes to prevent sudden jumps
+    let newScaleX = transform.scaleX;
+    let newScaleY = transform.scaleY;
+    
+    const scaleChangeX = Math.abs(newScaleX - this.prevTransform.scaleX) / this.prevTransform.scaleX;
+    const scaleChangeY = Math.abs(newScaleY - this.prevTransform.scaleY) / this.prevTransform.scaleY;
+    
+    if (scaleChangeX > this.maxScaleChange){
+      const maxChange = this.prevTransform.scaleX * this.maxScaleChange;
+      newScaleX = this.prevTransform.scaleX + Math.sign(newScaleX - this.prevTransform.scaleX) * maxChange;
     }
     
-    this.prevPrevCorners = this.prevCorners;
-    this.prevCorners = smoothed;
+    if (scaleChangeY > this.maxScaleChange){
+      const maxChange = this.prevTransform.scaleY * this.maxScaleChange;
+      newScaleY = this.prevTransform.scaleY + Math.sign(newScaleY - this.prevTransform.scaleY) * maxChange;
+    }
+    
+    const smoothedTransform = {
+      centerX: (1 - posAlpha) * this.prevTransform.centerX + posAlpha * transform.centerX,
+      centerY: (1 - posAlpha) * this.prevTransform.centerY + posAlpha * transform.centerY,
+      scaleX: (1 - scaleAlpha) * this.prevTransform.scaleX + scaleAlpha * newScaleX,
+      scaleY: (1 - scaleAlpha) * this.prevTransform.scaleY + scaleAlpha * newScaleY,
+      rotation: this._smoothAngle(this.prevTransform.rotation, targetRotation, rotAlpha)
+    };
+    
+    // Reconstruct corners from smoothed transform
+    const smoothedCorners = this._reconstructCorners(smoothedTransform);
+    
+    smoothedTransform.corners = smoothedCorners;
+    this.prevTransform = smoothedTransform;
+    
+    // Reset gyro accumulation after successful tracking update
+    if (this.useGyro){
+      this.accumulatedRotation = { x: 0, y: 0, z: 0 };
+    }
     
     const confidence = Math.min(0.95, 0.5 + matchCount / 40);
     this.confidenceHistory.push(confidence);
     if (this.confidenceHistory.length > 10) this.confidenceHistory.shift();
     
-    return { corners: smoothed, confidence, mode: 'tracking' };
+    return { corners: smoothedCorners, confidence, mode: 'tracking' };
   }
   
-  _predictCorners(){
-    if (!this.prevCorners || !this.velocity) return this.prevCorners;
+  _predictWithGyro(){
+    if (!this.prevTransform || !this.accumulatedRotation) return this.prevTransform;
     
-    const predicted = [];
-    for (let i = 0; i < 4; i++){
-      predicted.push({
-        x: this.prevCorners[i].x + this.velocity[i].x,
-        y: this.prevCorners[i].y + this.velocity[i].y
-      });
-    }
-    return predicted;
+    // Apply accumulated rotation to prediction
+    const predictedTransform = {
+      ...this.prevTransform,
+      rotation: this.prevTransform.rotation - this.accumulatedRotation.z
+    };
+    
+    const corners = this._reconstructCorners(predictedTransform);
+    
+    return { ...predictedTransform, corners };
   }
   
-  _cloneCorners(corners){
-    return corners.map(c => ({ x: c.x, y: c.y }));
+  _extractTransform(corners){
+    // Calculate center
+    const centerX = (corners[0].x + corners[1].x + corners[2].x + corners[3].x) / 4;
+    const centerY = (corners[0].y + corners[1].y + corners[2].y + corners[3].y) / 4;
+    
+    // Calculate scale using distances between opposite corners
+    const width1 = Math.hypot(corners[1].x - corners[0].x, corners[1].y - corners[0].y);
+    const width2 = Math.hypot(corners[2].x - corners[3].x, corners[2].y - corners[3].y);
+    const height1 = Math.hypot(corners[3].x - corners[0].x, corners[3].y - corners[0].y);
+    const height2 = Math.hypot(corners[2].x - corners[1].x, corners[2].y - corners[1].y);
+    
+    const scaleX = (width1 + width2) / 2;
+    const scaleY = (height1 + height2) / 2;
+    
+    // Calculate rotation from top edge
+    const dx = corners[1].x - corners[0].x;
+    const dy = corners[1].y - corners[0].y;
+    const rotation = Math.atan2(dy, dx);
+    
+    return {
+      centerX,
+      centerY,
+      scaleX,
+      scaleY,
+      rotation,
+      refWidth: scaleX,
+      refHeight: scaleY
+    };
+  }
+  
+  _reconstructCorners(transform){
+    const { centerX, centerY, scaleX, scaleY, rotation } = transform;
+    
+    // Define corners in local space (centered at origin)
+    const localCorners = [
+      { x: -scaleX / 2, y: -scaleY / 2 },
+      { x: scaleX / 2, y: -scaleY / 2 },
+      { x: scaleX / 2, y: scaleY / 2 },
+      { x: -scaleX / 2, y: scaleY / 2 }
+    ];
+    
+    // Apply rotation and translation
+    const cos = Math.cos(rotation);
+    const sin = Math.sin(rotation);
+    
+    return localCorners.map(corner => ({
+      x: centerX + corner.x * cos - corner.y * sin,
+      y: centerY + corner.x * sin + corner.y * cos
+    }));
+  }
+  
+  _smoothAngle(prevAngle, newAngle, alpha){
+    // Handle angle wrapping
+    let diff = newAngle - prevAngle;
+    
+    // Normalize to [-π, π]
+    while (diff > Math.PI) diff -= 2 * Math.PI;
+    while (diff < -Math.PI) diff += 2 * Math.PI;
+    
+    return prevAngle + alpha * diff;
   }
   
   reset(){
-    this.prevCorners = null;
-    this.prevPrevCorners = null;
-    this.velocity = null;
+    this.prevTransform = null;
     this.framesWithoutDetection = 0;
     this.isTracking = false;
     this.confidenceHistory = [];
+    this.lastGyroTimestamp = null;
+    this.accumulatedRotation = { x: 0, y: 0, z: 0 };
+    this.gyroBaseline = null;
   }
   
   shouldRelaxThresholds(){
