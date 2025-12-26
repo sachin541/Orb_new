@@ -1,3 +1,5 @@
+// app.js 
+
 import { DESCRIPTOR } from "./descriptor.js";
 import { buildLSHIndex, lshMatchRatio, TemporalTracker } from "./lsh.js";
 
@@ -20,7 +22,7 @@ function waitCV(){
 // ---------- Camera ----------
 async function startCamera(){
   const stream = await navigator.mediaDevices.getUserMedia({
-    video: { 
+    video: {
       facingMode: "environment",
       width: { ideal: 640 },
       height: { ideal: 480 }
@@ -76,41 +78,41 @@ function drawHUD(lines){
   ctx.restore();
 }
 
-function drawGyroHUD(gyroData, accumulatedRotation){
+function drawGyroHUD(imuData, accumulatedRotation, gyroSupported, gyroPermissionGranted, tracker){
   ctx.save();
   ctx.font = "15px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
   ctx.textBaseline = "top";
 
   const pad = 8;
   const lineH = 18;
-  
+
   const lines = [];
-  
-  if (gyroSupported){
-    lines.push("🔄 GYROSCOPE");
-    lines.push("───────────────");
-    
-    if (gyroData){
-      lines.push(`α: ${(gyroData.x * 180 / Math.PI).toFixed(1)}°/s`);
-      lines.push(`β: ${(gyroData.y * 180 / Math.PI).toFixed(1)}°/s`);
-      lines.push(`γ: ${(gyroData.z * 180 / Math.PI).toFixed(1)}°/s`);
+
+  lines.push("🔄 IMU SENSORS");
+  lines.push("───────────────");
+
+  if (gyroSupported || imuData.orientation){
+    if (imuData.gyro){
+      lines.push("Gyro (°/s):");
+      lines.push(`  γ: ${(imuData.gyro.z * 180 / Math.PI).toFixed(1)}`);
     }
-    
+
+    if (imuData.orientation){
+      lines.push("Orientation:");
+      lines.push(`  γ: ${imuData.orientation.gamma.toFixed(1)}°`);
+    }
+
     if (accumulatedRotation && tracker.isTracking){
       lines.push("");
-      lines.push("Accumulated:");
-      lines.push(`Z: ${(accumulatedRotation.z * 180 / Math.PI).toFixed(1)}°`);
+      lines.push("Accum rot (rad):");
+      lines.push(`  z: ${accumulatedRotation.z.toFixed(3)}`);
     }
   } else {
-    lines.push("🔄 GYROSCOPE");
-    lines.push("───────────────");
-    
-    // Show button prompt for iOS or not available message
-    if (typeof DeviceMotionEvent !== 'undefined' && 
-        typeof DeviceMotionEvent.requestPermission === 'function' &&
+    if (typeof DeviceMotionEvent !== "undefined" &&
+        typeof DeviceMotionEvent.requestPermission === "function" &&
         !gyroPermissionGranted){
       lines.push("Tap screen to");
-      lines.push("enable gyro");
+      lines.push("enable IMU");
     } else if (!gyroPermissionGranted) {
       lines.push("Checking...");
     } else {
@@ -136,19 +138,25 @@ function drawGyroHUD(gyroData, accumulatedRotation){
   ctx.restore();
 }
 
-// ---------- Temporal Tracker for smooth tracking ----------
+// ---------- Temporal Tracker (NO smoothing, Kalman + gyro only) ----------
 const tracker = new TemporalTracker({
-  smoothingFactor: 0.5,
-  scaleSmoothing: 0.15,
   minMatchesForUpdate: 4,
   maxFramesWithoutDetection: 12,
-  maxScaleChange: 0.15,
   useGyro: true,
-  gyroWeight: 0.3
+  gyroWeight: 0.15,
+  useKalmanFilter: true,
+  kalmanProcessNoise: 0.01,
+  kalmanMeasurementNoise: 0.5,
+  maxScaleChange: 0.25
 });
 
-// ---------- Gyroscope setup ----------
-let gyroData = null;
+
+// ---------- IMU sensors setup ----------
+let imuData = {
+  gyro: null,
+  accel: null,
+  orientation: null
+};
 let gyroSupported = false;
 let gyroPermissionGranted = false;
 
@@ -157,17 +165,16 @@ async function requestGyroPermission(){
     console.log("Gyroscope not supported on this device");
     return false;
   }
-  
+
   try {
-    // Request permission for iOS 13+
-    if (typeof DeviceMotionEvent.requestPermission === 'function'){
+    if (typeof DeviceMotionEvent.requestPermission === "function"){
       const permission = await DeviceMotionEvent.requestPermission();
-      if (permission !== 'granted'){
+      if (permission !== "granted"){
         console.log("Gyroscope permission denied");
         return false;
       }
     }
-    
+
     gyroPermissionGranted = true;
     setupGyroscopeListener();
     return true;
@@ -178,33 +185,46 @@ async function requestGyroPermission(){
 }
 
 function setupGyroscopeListener(){
-  window.addEventListener('devicemotion', (event) => {
+  window.addEventListener("devicemotion", (event) => {
     if (event.rotationRate){
-      gyroData = {
-        x: event.rotationRate.alpha * (Math.PI / 180), // Convert to rad/s
-        y: event.rotationRate.beta * (Math.PI / 180),
-        z: event.rotationRate.gamma * (Math.PI / 180)
+      imuData.gyro = {
+        x: (event.rotationRate.alpha || 0) * (Math.PI / 180),
+        y: (event.rotationRate.beta  || 0) * (Math.PI / 180),
+        z: (event.rotationRate.gamma || 0) * (Math.PI / 180)
       };
       gyroSupported = true;
     }
+
+    if (event.acceleration){
+      imuData.accel = {
+        x: event.acceleration.x || 0,
+        y: event.acceleration.y || 0,
+        z: event.acceleration.z || 0
+      };
+    }
   });
-  
-  console.log("Gyroscope listener enabled");
+
+  window.addEventListener("deviceorientation", (event) => {
+    imuData.orientation = {
+      alpha: event.alpha || 0,
+      beta: event.beta || 0,
+      gamma: event.gamma || 0
+    };
+  });
+
+  console.log("IMU sensors enabled");
 }
 
-// Try to enable gyroscope automatically (works on Android)
 async function setupGyroscope(){
   if (!window.DeviceMotionEvent){
     console.log("Gyroscope not supported");
     return;
   }
-  
-  // If no permission needed (Android), set up directly
-  if (typeof DeviceMotionEvent.requestPermission !== 'function'){
+
+  if (typeof DeviceMotionEvent.requestPermission !== "function"){
     setupGyroscopeListener();
     gyroPermissionGranted = true;
   }
-  // Otherwise (iOS), we'll wait for user to click the button
 }
 
 // ---------- Init ----------
@@ -212,11 +232,10 @@ await waitCV();
 await startCamera();
 await setupGyroscope();
 
-// Add click handler for iOS gyroscope permission
-canvas.addEventListener('click', async () => {
-  if (!gyroSupported && !gyroPermissionGranted && 
-      typeof DeviceMotionEvent !== 'undefined' &&
-      typeof DeviceMotionEvent.requestPermission === 'function'){
+canvas.addEventListener("click", async () => {
+  if (!gyroSupported && !gyroPermissionGranted &&
+      typeof DeviceMotionEvent !== "undefined" &&
+      typeof DeviceMotionEvent.requestPermission === "function"){
     console.log("Requesting gyroscope permission...");
     await requestGyroPermission();
   }
@@ -271,7 +290,7 @@ const refCorners = cv.matFromArray(4, 1, cv.CV_32FC2, [
   0, refH
 ]);
 
-// ---------- Build LSH Index (faster settings) ----------
+// ---------- Build LSH Index ----------
 const lshIndex = buildLSHIndex(refU8, refRows, {
   numTables: 10,
   keyBits: 18,
@@ -333,7 +352,7 @@ function loop(){
   let goodMatches = 0;
   let matchMs = 0;
   let homoMs  = 0;
-  let trackingMode = 'none';
+  let trackingMode = "none";
   let confidence = 0;
 
   const srcPts = [];
@@ -378,7 +397,6 @@ function loop(){
         const dstCorners = new cv.Mat();
         cv.perspectiveTransform(refCorners, dstCorners, H);
 
-        // Convert to JS array for tracker
         const rawCorners = [];
         for (let i = 0; i < 4; i++){
           rawCorners.push({
@@ -387,64 +405,41 @@ function loop(){
           });
         }
 
-        // Update tracker with detection and gyro data
-        const result = tracker.update(rawCorners, goodMatches, gyroData);
+        const result = tracker.update(rawCorners, goodMatches, imuData);
         trackingMode = result.mode;
         confidence = result.confidence;
 
-        // Draw smoothed/predicted corners
+        // Draw corners (Kalman output) in lime
         if (result.corners){
-          const smoothCorners = result.corners;
-          
+          const c = result.corners;
+
           ctx.save();
-          
-          // Color and style based on tracking mode
-          if (trackingMode === 'gyro-predicted'){
-            ctx.strokeStyle = "yellow";
-            ctx.setLineDash([10, 5]);
-          } else if (trackingMode === 'predicted'){
-            ctx.strokeStyle = "orange";
-            ctx.setLineDash([5, 5]);
-          } else if (trackingMode === 'tracking'){
-            ctx.strokeStyle = "lime";
-            ctx.setLineDash([]);
-          } else {
-            ctx.strokeStyle = "cyan";
-            ctx.setLineDash([]);
-          }
-          
+          ctx.strokeStyle = "lime";
           ctx.lineWidth = 3;
+          ctx.setLineDash([]);
           ctx.beginPath();
-          ctx.moveTo(smoothCorners[0].x, smoothCorners[0].y);
-          for (let i = 1; i < 4; i++){
-            ctx.lineTo(smoothCorners[i].x, smoothCorners[i].y);
-          }
+          ctx.moveTo(c[0].x, c[0].y);
+          for (let i = 1; i < 4; i++) ctx.lineTo(c[i].x, c[i].y);
           ctx.closePath();
           ctx.stroke();
-          ctx.setLineDash([]);
-          
           ctx.restore();
         }
-        
-        // Also draw raw detection in red for comparison
+
+        // Draw raw detection in red (dashed)
         ctx.save();
         ctx.strokeStyle = "rgba(255, 0, 0, 0.5)";
         ctx.lineWidth = 1;
         ctx.setLineDash([3, 3]);
         ctx.beginPath();
         ctx.moveTo(rawCorners[0].x, rawCorners[0].y);
-        for (let i = 1; i < 4; i++){
-          ctx.lineTo(rawCorners[i].x, rawCorners[i].y);
-        }
+        for (let i = 1; i < 4; i++) ctx.lineTo(rawCorners[i].x, rawCorners[i].y);
         ctx.closePath();
         ctx.stroke();
-        ctx.setLineDash([]);
         ctx.restore();
 
         dstCorners.delete();
       } else {
-        // No valid homography
-        tracker.update(null, 0, gyroData);
+        tracker.update(null, 0, imuData);
       }
 
       if (H) H.delete();
@@ -454,28 +449,23 @@ function loop(){
       const tH1 = performance.now();
       homoMs = tH1 - tH0;
     } else {
-      // Not enough matches
-      tracker.update(null, goodMatches, gyroData);
+      tracker.update(null, goodMatches, imuData);
     }
   } else {
-    // No descriptors
-    tracker.update(null, 0, gyroData);
+    tracker.update(null, 0, imuData);
   }
 
-  // cleanup per-frame
   descU8.delete();
   kps.delete();
 
   const tFrame1 = performance.now();
 
-  // timings
   const capMs    = tCap1  - tCap0;
   const grayMs   = tGray1 - tGray0;
   const orbMs    = tOrb1  - tOrb0;
   const imshowMs = tIm1   - tIm0;
   const totalMs  = tFrame1 - tFrame0;
 
-  // EMA
   tCapEma    = ema(tCapEma, capMs, 0.2);
   tGrayEma   = ema(tGrayEma, grayMs, 0.2);
   tOrbEma    = ema(tOrbEma, orbMs, 0.2);
@@ -484,7 +474,6 @@ function loop(){
   tImshowEma = ema(tImshowEma, imshowMs, 0.2);
   totalMsEma = ema(totalMsEma, totalMs, 0.2);
 
-  // FPS
   const dt = tFrame1 - lastT;
   lastT = tFrame1;
   const fps = dt > 0 ? 1000 / dt : 0;
@@ -492,8 +481,8 @@ function loop(){
 
   drawHUD([
     `RES: ${video.width}x${video.height} | KPs: ${kpCount} | Matches: ${goodMatches}`,
-    `Track: ${trackingMode} (conf: ${(confidence * 100).toFixed(0)}%) ${gyroSupported ? '🔄' : ''}`,
-    `🟢 Lime = Smoothed | 🔴 Red = Raw detection`,
+    `Track: ${trackingMode} (conf: ${(confidence * 100).toFixed(0)}%) ${gyroSupported ? "🔄" : ""}`,
+    `🟢 Lime = Kalman+Gyro | 🔴 Red = Raw detection`,
     `cap:    ${capMs.toFixed(2)} (avg ${tCapEma?.toFixed(2) ?? 0}) ms`,
     `gray:   ${grayMs.toFixed(2)} (avg ${tGrayEma?.toFixed(2) ?? 0}) ms`,
     `orb:    ${orbMs.toFixed(2)} (avg ${tOrbEma?.toFixed(2) ?? 0}) ms`,
@@ -503,9 +492,8 @@ function loop(){
     `TOTAL:  ${totalMs.toFixed(2)} (avg ${totalMsEma?.toFixed(2) ?? 0}) ms`,
     `FPS:    ${fps.toFixed(1)} (avg ${fpsEma?.toFixed(1) ?? 0})`
   ]);
-  
-  // Draw gyro data on the right
-  drawGyroHUD(gyroData, tracker.accumulatedRotation);
+
+  drawGyroHUD(imuData, tracker.accumulatedRotation, gyroSupported, gyroPermissionGranted, tracker);
 
   requestAnimationFrame(loop);
 }

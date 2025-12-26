@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>IMU Relative Movement Demo</title>
+  <style>
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: #0b0f14; color: #e8eef5; }
+    .wrap { max-width: 900px; margin: 0 auto; padding: 16px; }
+    .row { display: grid; grid-template-columns: 1fr; gap: 12px; }
+    @media (min-width: 860px){ .row { grid-template-columns: 1.2fr 0.8fr; } }
+    .card { background: #111826; border: 1px solid #1c2a3d; border-radius: 14px; padding: 12px; }
+    button { border: 0; padding: 10px 12px; border-radius: 10px; background: #2a6df4; color: #fff; font-weight: 700; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btns { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 0; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    label { font-size: 12px; opacity: 0.9; display: block; margin-bottom: 6px; }
+    input[type="range"] { width: 100%; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; white-space: pre-wrap; line-height: 1.35; }
+    canvas { width: 100%; height: 360px; background: radial-gradient(1200px 500px at 50% 30%, #142033 0%, #0b0f14 60%); border-radius: 14px; border: 1px solid #1c2a3d; }
+    .hint { font-size: 12px; opacity: 0.85; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; border: 1px solid #1c2a3d; background: #0f1622; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h2 style="margin: 6px 0 10px;">Phone IMU → Relative Movement (Gyro + Accel)</h2>
+    <div class="hint">
+      <span class="pill">Tip</span> Open this page on your phone (https / localhost). Tap <b>Start Sensors</b>, then move/rotate the device.
+      Drift is normal — use <b>Zero</b> to reset.
+    </div>
+
+    <div class="row" style="margin-top: 12px;">
+      <div class="card">
+        <canvas id="view" width="900" height="360"></canvas>
+        <div class="btns">
+          <button id="startBtn">Start Sensors</button>
+          <button id="stopBtn" disabled>Stop</button>
+          <button id="zeroBtn" disabled>Zero (Reset Pose)</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="grid2">
+          <div>
+            <label>Accel threshold (m/s²) — ignore tiny noise</label>
+            <input id="accThresh" type="range" min="0" max="2" step="0.01" value="0.15">
+            <div class="hint"><span id="accThreshVal">0.15</span></div>
+          </div>
+          <div>
+            <label>Velocity damping — reduces drift</label>
+            <input id="velDamp" type="range" min="0" max="0.2" step="0.001" value="0.04">
+            <div class="hint"><span id="velDampVal">0.04</span></div>
+          </div>
+          <div>
+            <label>Position scale — how far the dot moves</label>
+            <input id="posScale" type="range" min="50" max="800" step="1" value="260">
+            <div class="hint"><span id="posScaleVal">260</span></div>
+          </div>
+          <div>
+            <label>Gyro smoothing (0 = none)</label>
+            <input id="gyroSmooth" type="range" min="0" max="0.5" step="0.01" value="0.12">
+            <div class="hint"><span id="gyroSmoothVal">0.12</span></div>
+          </div>
+        </div>
+
+        <hr style="border:0;border-top:1px solid #1c2a3d; margin: 12px 0;">
+        <div class="mono" id="telemetry">Telemetry: (waiting)</div>
+      </div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  // ---------------------------
+  // Simple IMU relative pose demo
+  // - Integrate acceleration -> velocity -> position (very drift-prone)
+  // - Integrate gyroscope -> relative rotation (also drifts)
+  // ---------------------------
+
+  const canvas = document.getElementById('view');
+  const ctx = canvas.getContext('2d');
+
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn  = document.getElementById('stopBtn');
+  const zeroBtn  = document.getElementById('zeroBtn');
+
+  const accThreshEl = document.getElementById('accThresh');
+  const velDampEl   = document.getElementById('velDamp');
+  const posScaleEl  = document.getElementById('posScale');
+  const gyroSmoothEl= document.getElementById('gyroSmooth');
+
+  const accThreshVal = document.getElementById('accThreshVal');
+  const velDampVal   = document.getElementById('velDampVal');
+  const posScaleVal  = document.getElementById('posScaleVal');
+  const gyroSmoothVal= document.getElementById('gyroSmoothVal');
+
+  const telemetry = document.getElementById('telemetry');
+
+  function bindRange(el, outEl){
+    const upd = () => outEl.textContent = (+el.value).toFixed(el.step && el.step.includes('.') ? el.step.split('.')[1].length : 0);
+    el.addEventListener('input', upd);
+    upd();
+  }
+  bindRange(accThreshEl, accThreshVal);
+  bindRange(velDampEl, velDampVal);
+  bindRange(posScaleEl, posScaleVal);
+  bindRange(gyroSmoothEl, gyroSmoothVal);
+
+  // State: position in "meters-ish" (not absolute), velocity in m/s, orientation in radians
+  let running = false;
+
+  let lastT = null;
+
+  // Relative translation estimate (device frame-ish)
+  let vx = 0, vy = 0, vz = 0;
+  let px = 0, py = 0, pz = 0;
+
+  // Relative rotation estimate
+  let roll = 0, pitch = 0, yaw = 0;
+
+  // Latest sensor readings
+  let ax = 0, ay = 0, az = 0;            // m/s^2 (includes gravity depending on API)
+  let gx = 0, gy = 0, gz = 0;            // rad/s (we will convert from deg/s if needed)
+  let hasAccel = false;
+  let hasGyro = false;
+
+  // Optional: if deviceorientation is available
+  let absAlpha = null, absBeta = null, absGamma = null;
+
+  let accelListener = null;
+  let orientationListener = null;
+
+  function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+
+  function zeroPose(){
+    vx = vy = vz = 0;
+    px = py = pz = 0;
+    roll = pitch = yaw = 0;
+    lastT = null;
+  }
+
+  // Small helper: low-pass blend
+  function lerp(a, b, t){ return a + (b - a) * t; }
+
+  async function requestiOSPermissionIfNeeded(){
+    // iOS 13+ requires a user gesture + explicit permission for sensors
+    const DME = window.DeviceMotionEvent;
+    const DOE = window.DeviceOrientationEvent;
+
+    // DeviceMotion permission
+    if (DME && typeof DME.requestPermission === 'function') {
+      const res = await DME.requestPermission();
+      if (res !== 'granted') throw new Error('DeviceMotion permission not granted.');
+    }
+    // DeviceOrientation permission
+    if (DOE && typeof DOE.requestPermission === 'function') {
+      const res = await DOE.requestPermission();
+      // some iOS versions gate this separately
+      if (res !== 'granted') {
+        // not fatal; we can still run without orientation
+        console.warn('DeviceOrientation permission not granted.');
+      }
+    }
+  }
+
+  function startSensors(){
+    // Use devicemotion for accel + gyro
+    accelListener = (e) => {
+      // Prefer acceleration (without gravity) when available
+      const a = e.acceleration || null;
+      const ag = e.accelerationIncludingGravity || null;
+
+      // If e.acceleration is null on some devices, fall back to includingGravity
+      if (a && a.x != null) {
+        ax = a.x; ay = a.y; az = a.z;
+      } else if (ag && ag.x != null) {
+        ax = ag.x; ay = ag.y; az = ag.z;
+      }
+      hasAccel = (ax != null && ay != null && az != null);
+
+      // rotationRate is usually in deg/s (alpha,beta,gamma)
+      // Convert to rad/s for integration.
+      if (e.rotationRate) {
+        // rotationRate: alpha(z), beta(x), gamma(y) in deg/s (usually)
+        // We'll map to gx, gy, gz in a consistent way:
+        // gx ~ beta (x), gy ~ gamma (y), gz ~ alpha (z)
+        const rr = e.rotationRate;
+        const deg2rad = Math.PI / 180;
+        gx = (rr.beta  != null ? rr.beta  : 0) * deg2rad;
+        gy = (rr.gamma != null ? rr.gamma : 0) * deg2rad;
+        gz = (rr.alpha != null ? rr.alpha : 0) * deg2rad;
+        hasGyro = true;
+      }
+    };
+
+    window.addEventListener('devicemotion', accelListener, { passive: true });
+
+    // Optional absolute orientation (useful for debugging / sanity)
+    orientationListener = (e) => {
+      absAlpha = e.alpha; // 0..360
+      absBeta  = e.beta;  // -180..180
+      absGamma = e.gamma; // -90..90
+    };
+    window.addEventListener('deviceorientation', orientationListener, { passive: true });
+  }
+
+  function stopSensors(){
+    if (accelListener) window.removeEventListener('devicemotion', accelListener);
+    if (orientationListener) window.removeEventListener('deviceorientation', orientationListener);
+    accelListener = null;
+    orientationListener = null;
+  }
+
+  function step(t){
+    if (!running) return;
+
+    if (lastT == null) lastT = t;
+    let dt = (t - lastT) / 1000;
+    lastT = t;
+
+    // Guard dt spikes (tab switching etc.)
+    dt = clamp(dt, 0, 0.05);
+
+    // Settings
+    const accThresh = +accThreshEl.value;
+    const velDamp   = +velDampEl.value;
+    const posScale  = +posScaleEl.value;
+    const gyroSmooth= +gyroSmoothEl.value;
+
+    // --------- integrate gyro (relative rotation) ---------
+    // gyro smoothing: blend angular velocities a bit to reduce jitter
+    // We keep a smoothed gyro estimate internally
+    step.gxs = step.gxs ?? 0;
+    step.gys = step.gys ?? 0;
+    step.gzs = step.gzs ?? 0;
+
+    step.gxs = lerp(step.gxs, gx, gyroSmooth);
+    step.gys = lerp(step.gys, gy, gyroSmooth);
+    step.gzs = lerp(step.gzs, gz, gyroSmooth);
+
+    // Integrate (roll around x, pitch around y, yaw around z)
+    roll  += step.gxs * dt;
+    pitch += step.gys * dt;
+    yaw   += step.gzs * dt;
+
+    // --------- integrate accel (relative translation) ---------
+    // NOTE: This is a very naive "dead reckoning". Without filtering/gravity separation,
+    // it will drift quickly. Use thresholding + damping to make it usable in a demo.
+
+    let fx = ax, fy = ay, fz = az;
+
+    // Noise gate / threshold
+    if (Math.abs(fx) < accThresh) fx = 0;
+    if (Math.abs(fy) < accThresh) fy = 0;
+    if (Math.abs(fz) < accThresh) fz = 0;
+
+    // Basic integration
+    vx += fx * dt;
+    vy += fy * dt;
+    vz += fz * dt;
+
+    // Damping (reduces drift)
+    const damp = Math.exp(-velDamp * 60 * dt); // scaled for "feel"
+    vx *= damp; vy *= damp; vz *= damp;
+
+    px += vx * dt;
+    py += vy * dt;
+    pz += vz * dt;
+
+    // --------- draw ---------
+    draw(posScale);
+
+    telemetry.textContent =
+`Telemetry
+---------
+Accel (m/s²):  ax=${ax.toFixed(3)}  ay=${ay.toFixed(3)}  az=${az.toFixed(3)}
+Gyro  (rad/s): gx=${gx.toFixed(3)}  gy=${gy.toFixed(3)}  gz=${gz.toFixed(3)}
+Vel   (m/s):   vx=${vx.toFixed(3)}  vy=${vy.toFixed(3)}  vz=${vz.toFixed(3)}
+Pos   (m):     px=${px.toFixed(3)}  py=${py.toFixed(3)}  pz=${pz.toFixed(3)}
+Rot   (rad):   roll=${roll.toFixed(3)} pitch=${pitch.toFixed(3)} yaw=${yaw.toFixed(3)}
+
+Abs orientation (deg, if available):
+alpha=${absAlpha == null ? 'n/a' : absAlpha.toFixed(1)}
+beta =${absBeta  == null ? 'n/a' : absBeta.toFixed(1)}
+gamma=${absGamma == null ? 'n/a' : absGamma.toFixed(1)}
+`;
+    requestAnimationFrame(step);
+  }
+
+  function draw(posScale){
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+
+    // Center crosshair
+    ctx.globalAlpha = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(w/2, 0); ctx.lineTo(w/2, h);
+    ctx.moveTo(0, h/2); ctx.lineTo(w, h/2);
+    ctx.strokeStyle = "#2a3c56";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // Convert "position" to pixels (x right, y down)
+    // Note: axis directions depend on device orientation; this is a demo.
+    const x = w/2 + px * posScale;
+    const y = h/2 + py * posScale;
+
+    // Draw "rotation cube" (2D proxy): a rotating square
+    const cx = w * 0.18, cy = h * 0.5;
+    const size = Math.min(w, h) * 0.18;
+
+    // use yaw as visible rotation
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(yaw);
+    ctx.strokeStyle = "#9cc2ff";
+    ctx.lineWidth = 4;
+    ctx.strokeRect(-size/2, -size/2, size, size);
+    ctx.restore();
+
+    // Moving dot (translation)
+    ctx.beginPath();
+    ctx.arc(x, y, 14, 0, Math.PI * 2);
+    ctx.fillStyle = "#2a6df4";
+    ctx.fill();
+
+    // Tail/indicator line showing yaw direction at dot
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(yaw);
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(40, 0);
+    ctx.strokeStyle = "#e8eef5";
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    ctx.restore();
+
+    // Labels
+    ctx.fillStyle = "#e8eef5";
+    ctx.font = "16px system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
+    ctx.fillText("Rotation (relative): square rotates with gyro-integrated yaw", 16, 28);
+    ctx.fillText("Translation (relative): dot moves from integrated acceleration", 16, 52);
+  }
+
+  async function start(){
+    if (running) return;
+    try {
+      await requestiOSPermissionIfNeeded();
+      startSensors();
+      running = true;
+      lastT = null;
+
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      zeroBtn.disabled = false;
+
+      requestAnimationFrame(step);
+    } catch (err) {
+      alert(err?.message || String(err));
+      console.error(err);
+    }
+  }
+
+  function stop(){
+    if (!running) return;
+    running = false;
+    stopSensors();
+
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    zeroBtn.disabled = true;
+  }
+
+  startBtn.addEventListener('click', start);
+  stopBtn.addEventListener('click', stop);
+  zeroBtn.addEventListener('click', zeroPose);
+
+  // Draw initial UI
+  draw(+posScaleEl.value);
+})();
+</script>
+</body>
+</html>
