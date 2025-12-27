@@ -42,14 +42,14 @@ runBtn.onclick = async () => {
 
   // -------- ORB PARAMETERS (LOCK THESE) --------
 const ORB = {
-  nfeatures: 5000,        // Maximum number of keypoints to retain.
+  nfeatures: 10000,        // Maximum number of keypoints to retain.
                           // Higher = more matches & robustness, but slower.
 
-  scaleFactor: 1.2,       // Image pyramid scale factor between levels.
+  scaleFactor: 1.1,       // Image pyramid scale factor between levels.
                           // Smaller (e.g. 1.1) = better scale invariance, slower.
                           // Larger (e.g. 1.3) = faster, worse for scale changes.
 
-  nlevels: 8,             // Number of pyramid levels.
+  nlevels: 32,             // Number of pyramid levels.
                           // More levels = better detection at different scales.
 
   edgeThreshold: 10,      // Minimum distance (in pixels) from image borders.
@@ -71,7 +71,7 @@ const ORB = {
   patchSize: 31,          // Size of the patch used for orientation & descriptor.
                           // Larger = more robust orientation, slightly slower.
 
-  fastThreshold: 12       // Threshold for FAST corner detector.
+  fastThreshold: 10       // Threshold for FAST corner detector.
                           // Lower = more keypoints (noisier).
                           // Higher = fewer, stronger, more reliable keypoints.
 };
